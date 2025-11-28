@@ -3,3 +3,11 @@ torch==2.9.0
 torchaudio==2.9.0
 pathlib
 torchcodec
+hydra-core 
+omegaconf 
+openai-whisper 
+pystoi 
+jiwer 
+inflect 
+scipy 
+pandas

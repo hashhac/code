@@ -2,371 +2,378 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
-import torchaudio.transforms as T
-from torch.utils.data import Dataset, DataLoader
+import os
 from pathlib import Path
 import json
-import os
-from encodec import EncodecModel
 from encodec.utils import convert_audio
 
-print("Initializing System: HEAVYWEIGHT CONFIGURATION")
+print("Initializing Stage 3: The Magnum Opus (Final Polish) YAYS! 🎉")
 
 # ==============================================================================
-# PART 1: "MAX CAPACITY" CONFIGURATION
+# PART 1: CONFIGURATION
 # ==============================================================================
 
-# Upsampling Setup
-HOP_LENGTH = 256           
-N_FFT = 1024
-print(f"Hop Length: {HOP_LENGTH}, FFT Size: {N_FFT} and D model is 1024")
-# --- THE UPGRADE ---
-N_MELS = 128               # High Res Input
-D_MODEL = 1024              # WAS 256 -> DOUBLED (The "Brain Width")
-N_HEAD = 8                 # WAS 4   -> DOUBLED (More attention context)
-NUM_LAYERS = 12            # WAS 6   -> DOUBLED (Deeper reasoning)
+N_FFT = 2048        
+HOP_LENGTH = 512    
+WIN_LENGTH = 2048
+SAMPLE_RATE = 24000
 
-# VRAM MANAGEMENT
-BATCH_SIZE = 4             # REDUCED from 16 to fit the massive model
-                           # If OOM (Out of Memory), set to 4.
-
-LEARNING_RATE = 1e-4       # Standard for large Transformers
+BATCH_SIZE = 2      
+ACCUM_STEPS = 16    # Virtual Batch Size = 32
+LEARNING_RATE = 2e-4 
 NUM_EPOCHS = 100
-WARMUP_EPOCHS = 5          # Keep the identity warmup!
+WARMUP_EPOCHS = 5   
 
-# Loss Weights (The "Token Pivot" Strategy)
-LAMBDA_SEMANTIC = 10.0     # CRITICAL: This is the main goal now.
-LAMBDA_PERCEPTUAL = 2.0    # Keep spectral shape correct
-LAMBDA_MEL = 5.0           # Reduced slightly to let tokens take priority
-LAMBDA_SIGNAL = 0.0        # OFF (Kills the buzz)
-LAMBDA_PHASE = 0.0         # OFF
-LAMBDA_HARMONIC = 0.0      # OFF
-
-# Config
-TARGET_BANDWIDTH = 24.0
-MAX_GRAD_NORM = 1.0        # Tighter clipping for deeper networks
-
-# Paths
 DRIVE_BASE = Path("Candanza Data/cadenza_data")
 METADATA_DIR = DRIVE_BASE / "metadata"
-CHECKPOINT_DIR = Path("Checkpoints")
-SAMPLE_DIR = Path("Training_Samples") 
+CHECKPOINT_DIR = Path("Mask_Checkpoints")
+SAMPLE_DIR = Path("Mask_Samples")
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
-print(f"Model Dimensions: {D_MODEL}x{NUM_LAYERS} (Heads: {N_HEAD})")
 
 # ==============================================================================
-# PART 2 & 3: SETUP & LOSSES (Standard - No Changes Needed)
+# PART 2: LOSS FUNCTION
 # ==============================================================================
-# [Paste your standard EnCodec loading and Loss Classes here]
-# ... (MultiResolutionSTFTLoss, MelSpectrogramLoss) ...
-# I will skip pasting them to save space, they remain exactly the same.
 
-# [RE-INSERT YOUR LOSS CLASSES HERE IF COPY-PASTING THE WHOLE FILE]
-class MultiResolutionSTFTLoss(nn.Module):
-    def __init__(self, fft_sizes=[1024, 2048, 512], hop_sizes=[120, 240, 50], win_lengths=[600, 1200, 240]):
+class AudioLoss(nn.Module):
+    def __init__(self, n_freqs=1025, sample_rate=24000):
         super().__init__()
-        self.fft_sizes = fft_sizes
-        self.hop_sizes = hop_sizes
-        self.win_lengths = win_lengths
-    def forward(self, y_hat, y):
-        total_loss = 0.0
-        for fft_size, hop_size, win_length in zip(self.fft_sizes, self.hop_sizes, self.win_lengths):
-            window = torch.hann_window(win_length).to(y.device)
-            S_hat = torch.stft(y_hat, n_fft=fft_size, hop_length=hop_size, win_length=win_length, return_complex=True, window=window)
-            S = torch.stft(y, n_fft=fft_size, hop_length=hop_size, win_length=win_length, return_complex=True, window=window)
-            S_hat_mag = torch.abs(S_hat)
-            S_mag = torch.abs(S)
-            sc_loss = torch.norm(S_mag - S_hat_mag, p='fro') / (torch.norm(S_mag, p='fro') + 1e-7)
-            mag_loss = F.l1_loss(torch.log(S_mag + 1e-7), torch.log(S_hat_mag + 1e-7))
-            total_loss += sc_loss + mag_loss
-        return total_loss / len(self.fft_sizes)
-
-class MelSpectrogramLoss(nn.Module):
-    def __init__(self, sample_rate=24000, n_fft=1024, hop_length=256, n_mels=80):
-        super().__init__()
-        self.mel_transform = T.MelSpectrogram(sample_rate=sample_rate, n_fft=n_fft, hop_length=hop_length, n_mels=n_mels)
-    def forward(self, y_hat, y):
-        self.mel_transform = self.mel_transform.to(y.device)
-        mel_hat = self.mel_transform(y_hat)
-        mel_target = self.mel_transform(y)
-        return F.l1_loss(torch.log(mel_hat + 1e-7), torch.log(mel_target + 1e-7))
+        
+        # Create mel filterbank [1025, 128]
+        mel_basis = torchaudio.functional.melscale_fbanks(
+            n_freqs=n_freqs, 
+            n_mels=128, 
+            sample_rate=sample_rate,
+            f_min=80, 
+            f_max=8000 
+        ).to(device)
+        
+        # Sum over mels (dim=1) to get weights per Frequency Bin [1025]
+        freq_weights = mel_basis.sum(dim=1)
+        freq_weights = freq_weights / (freq_weights.max() + 1e-8)
+        
+        # Reshape to [1, 1, 1025] for broadcasting
+        self.register_buffer('freq_weights', freq_weights.unsqueeze(0).unsqueeze(0))
+        
+    def forward(self, est_mag, target_mag):
+        # Normalize by target max per sample for scale invariance
+        target_max = target_mag.amax(dim=(1, 2), keepdim=True) + 1e-8
+        est_mag_norm = est_mag / target_max
+        target_mag_norm = target_mag / target_max
+        
+        # 1. Weighted Magnitude Loss
+        raw_mag_loss = F.l1_loss(est_mag_norm, target_mag_norm, reduction='none')
+        mag_loss = (raw_mag_loss * self.freq_weights).mean()
+        
+        # 2. Log Magnitude Loss (log1p for stability)
+        log_loss = F.l1_loss(torch.log1p(est_mag_norm), torch.log1p(target_mag_norm))
+        
+        # 3. Spectral Convergence
+        sc_loss = torch.norm(target_mag_norm - est_mag_norm, p='fro') / \
+                  (torch.norm(target_mag_norm, p='fro') + 1e-8)
+        
+        total_loss = mag_loss + 0.5 * log_loss + 0.5 * sc_loss
+        
+        return total_loss, {'mag': mag_loss.item(), 'log': log_loss.item(), 'sc': sc_loss.item()}
 
 # ==============================================================================
-# PART 4: ARCHITECTURE (SCALED UP)
+# PART 3: DATASET & PADDING
 # ==============================================================================
 
-class ResBlock1D(nn.Module):
-    def __init__(self, channels, kernel_size=3, dilation=1):
-        super().__init__()
-        self.convs = nn.Sequential(
-            nn.LeakyReLU(0.1),
-            nn.Conv1d(channels, channels, kernel_size, dilation=dilation, padding=(kernel_size-1)*dilation//2),
-            nn.LeakyReLU(0.1),
-            nn.Conv1d(channels, channels, kernel_size, dilation=1, padding=(kernel_size-1)//2)
-        )
-    def forward(self, x): return x + self.convs(x)
-
-class HiFiDecoderBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, upsample_factor):
-        super().__init__()
-        self.upsample = nn.ConvTranspose1d(in_channels, out_channels, kernel_size=upsample_factor*2, stride=upsample_factor, padding=upsample_factor//2)
-        self.res1 = ResBlock1D(out_channels, kernel_size=3, dilation=1)
-        self.res2 = ResBlock1D(out_channels, kernel_size=7, dilation=3)
-    def forward(self, x):
-        x = self.upsample(x)
-        x = self.res1(x)
-        x = self.res2(x)
-        return x
-
-class SpeechEnhancementConformer(nn.Module):
-    def __init__(self, input_features, num_tokens, num_codebooks, d_model, nhead, num_layers):
-        super().__init__()
-        self.num_codebooks = num_codebooks
-        self.num_tokens = num_tokens
-
-        # Encoder Projection
-        self.input_proj = nn.Linear(input_features, d_model)
-        self.pos_encoder = nn.Parameter(torch.randn(1, 4000, d_model) * 0.02)
+class MaskingDataset(torch.utils.data.Dataset):
+    def __init__(self, metadata_path, unproc_dir, clean_dir, n_fft, hop, device):
+        self.unproc_dir = Path(unproc_dir)
+        self.clean_dir = Path(clean_dir)
+        self.n_fft = n_fft
+        self.hop = hop
+        self.device = device
+        self.window = torch.hann_window(n_fft).to(device)
         
-        # SCALED UP TRANSFORMER BACKBONE
-        # dim_feedforward is usually 4x d_model. With d_model=512, this is 2048.
-        # This is where the "Memory" of the model lives.
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, 
-            nhead=nhead, 
-            dim_feedforward=d_model * 4, 
-            dropout=0.1, 
-            batch_first=True,
-            norm_first=True # Pre-Norm usually trains better for deep models
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        
-        # Head 1: Tokens (The Primary Output)
-        self.output_proj_logits = nn.Linear(d_model, num_codebooks * num_tokens)
-        
-        # Head 2: Audio Decoder (For Monitoring/Aux Loss)
-        self.decoder_layers = nn.Sequential(
-            HiFiDecoderBlock(d_model, d_model // 2, 8),
-            HiFiDecoderBlock(d_model // 2, d_model // 4, 8),
-            HiFiDecoderBlock(d_model // 4, d_model // 8, 4),
-        )
-        self.final_conv = nn.Sequential(
-            nn.LeakyReLU(0.1),
-            nn.Conv1d(d_model // 8, 1, kernel_size=7, padding=3),
-            nn.Tanh()
-        )
-        self.apply(self._init_weights)
-
-    def _init_weights(self, m):
-        if isinstance(m, (nn.Conv1d, nn.ConvTranspose1d, nn.Linear)):
-            nn.init.xavier_uniform_(m.weight)
-            if m.bias is not None: nn.init.constant_(m.bias, 0)
-
-    def forward(self, x):
-        x_enc = self.input_proj(x)
-        x_enc = x_enc + self.pos_encoder[:, :x_enc.size(1), :]
-        x_enc = self.encoder(x_enc)
-        
-        logits = self.output_proj_logits(x_enc).view(x_enc.shape[0], x_enc.shape[1], self.num_codebooks, self.num_tokens)
-        
-        x_dec = x_enc.transpose(1, 2)
-        x_dec = self.decoder_layers(x_dec)
-        pred_wav = self.final_conv(x_dec)
-        return logits, pred_wav
-
-# ==============================================================================
-# PART 5: DATASET (Standard)
-# ==============================================================================
-# (This remains exactly the same as the previous correct version)
-# Ensure you copy the EncodecAudioDataset class from the previous code block
-# Returns: specs, tokens, clean_wavs, unproc_wavs
-
-# [RE-INSERT DATASET CLASS HERE]
-class EncodecAudioDataset(Dataset):
-    def __init__(self, metadata_path, unprocessed_dir, signals_dir, mel_transform, 
-                 encodec_model, num_active_codebooks, device):
-        self.mel_transform = mel_transform
-        self.encodec_model = encodec_model
-        self.num_active_codebooks = num_active_codebooks
-        self.device = device 
         if os.path.exists(metadata_path):
-            with open(metadata_path, "r") as f: self.file_ids = [item['signal'] for item in json.load(f)]
-        else: self.file_ids = []
-        self.unprocessed_dir = Path(unprocessed_dir)
-        self.signals_dir = Path(signals_dir)
-
+            with open(metadata_path, "r") as f:
+                self.file_ids = [item['signal'] for item in json.load(f)]
+        else:
+            self.file_ids = []
+            
     def __len__(self): return len(self.file_ids)
 
     def __getitem__(self, index):
         try:
             file_id = self.file_ids[index]
-            unprocessed_path = self.unprocessed_dir / f"{file_id}_unproc.flac"
-            clean_path = self.signals_dir / f"{file_id}.flac"
+            unproc_path = self.unproc_dir / f"{file_id}_unproc.flac"
+            clean_path = self.clean_dir / f"{file_id}.flac"
             
-            unprocessed_wav, sr = torchaudio.load(unprocessed_path)
-            unprocessed_wav = convert_audio(unprocessed_wav, sr, 24000, 1)
-            
-            unprocessed_wav_gpu = unprocessed_wav.to(self.device)
-            mel_spec = self.mel_transform(unprocessed_wav_gpu)
-            log_mel_spec = torch.log(mel_spec + 1e-5)
-            log_mel_spec = (log_mel_spec - (-4.0)) / 4.0
-            input_spectrogram = log_mel_spec.squeeze(0).transpose(0, 1)
-
+            # Load & Convert
+            unproc_wav, sr = torchaudio.load(unproc_path)
+            unproc_wav = convert_audio(unproc_wav, sr, SAMPLE_RATE, 1) 
             clean_wav, sr = torchaudio.load(clean_path)
-            clean_wav = convert_audio(clean_wav, sr, 24000, 1) 
+            clean_wav = convert_audio(clean_wav, sr, SAMPLE_RATE, 1)
             
-            clean_wav_gpu = clean_wav.to(self.device)
-            with torch.no_grad():
-                encoded_frames = self.encodec_model.encode(clean_wav_gpu.unsqueeze(0))
-                all_tokens = encoded_frames[0][0]
-                if all_tokens.dim() == 3: all_tokens = all_tokens.squeeze(0)
-                target_tokens = all_tokens
-
-            spec_len = input_spectrogram.shape[0]
-            token_len = target_tokens.shape[1]
-            min_frames = min(spec_len, token_len)
+            # Align
+            min_len = min(unproc_wav.shape[-1], clean_wav.shape[-1])
+            unproc_wav = unproc_wav[..., :min_len].to(self.device)
+            clean_wav = clean_wav[..., :min_len].to(self.device)
             
-            input_spectrogram = input_spectrogram[:min_frames, :]
-            target_tokens = target_tokens[:, :min_frames]
+            # STFT
+            unproc_stft = torch.stft(unproc_wav, n_fft=self.n_fft, hop_length=self.hop, window=self.window, return_complex=True)
+            clean_stft = torch.stft(clean_wav, n_fft=self.n_fft, hop_length=self.hop, window=self.window, return_complex=True)
             
-            expected_samples = min_frames * HOP_LENGTH
-            if clean_wav.shape[-1] < expected_samples: clean_wav = F.pad(clean_wav, (0, expected_samples - clean_wav.shape[-1]))
-            else: clean_wav = clean_wav[..., :expected_samples]
-            if unprocessed_wav.shape[-1] < expected_samples: unprocessed_wav = F.pad(unprocessed_wav, (0, expected_samples - unprocessed_wav.shape[-1]))
-            else: unprocessed_wav = unprocessed_wav[..., :expected_samples]
+            unproc_mag = torch.abs(unproc_stft) + 1e-9
+            clean_mag = torch.abs(clean_stft) + 1e-9
             
-            return input_spectrogram.cpu(), target_tokens.cpu(), clean_wav, unprocessed_wav
+            # Per-Sample Input Normalization
+            unproc_log = torch.log(unproc_mag)
+            unproc_log = torch.clamp(unproc_log, min=-20.0)
+            
+            mean = unproc_log.mean()
+            std = unproc_log.std() + 1e-5
+            model_input = (unproc_log - mean) / std
+            
+            # Transpose to [Time, Freq]
+            model_input = model_input.squeeze(0).transpose(0, 1)
+            
+            return model_input, unproc_stft.squeeze(0), clean_mag.squeeze(0)
+            
         except Exception as e:
-            print(f"Error: {e}")
             return None
-            
+
 def pad_collate(batch):
     batch = [b for b in batch if b is not None]
-    if len(batch) == 0: return None, None, None, None
-    (specs, tokens, clean_wavs, unproc_wavs) = zip(*batch)
-    specs_padded = nn.utils.rnn.pad_sequence(specs, batch_first=True, padding_value=0.0)
-    tokens_transposed = [t.transpose(0, 1) for t in tokens]
-    tokens_padded = nn.utils.rnn.pad_sequence(tokens_transposed, batch_first=True, padding_value=0).permute(0, 2, 1)
-    clean_transposed = [w.transpose(0, 1) for w in clean_wavs]
-    clean_padded = nn.utils.rnn.pad_sequence(clean_transposed, batch_first=True, padding_value=0.0).permute(0, 2, 1)
-    unproc_transposed = [w.transpose(0, 1) for w in unproc_wavs]
-    unproc_padded = nn.utils.rnn.pad_sequence(unproc_transposed, batch_first=True, padding_value=0.0).permute(0, 2, 1)
-    return specs_padded, tokens_padded, clean_padded, unproc_padded
+    if len(batch) == 0: return None, None, None
+    
+    (inputs, unproc_stfts, clean_mags) = zip(*batch)
+    
+    # Pad Inputs
+    inputs_padded = nn.utils.rnn.pad_sequence(inputs, batch_first=True, padding_value=0.0)
+    
+    # Pad Complex STFT
+    def pad_complex(c_list):
+        transposed = [x.transpose(0, 1) for x in c_list] # [Time, Freq]
+        max_len = max(x.shape[0] for x in transposed)
+        padded_list = []
+        for item in transposed:
+            if item.shape[0] < max_len:
+                diff = max_len - item.shape[0]
+                try:
+                    padded = F.pad(item, (0, 0, 0, diff))
+                except:
+                    # Fallback
+                    padded = torch.complex(F.pad(item.real, (0, 0, 0, diff)), F.pad(item.imag, (0, 0, 0, diff)))
+            else:
+                padded = item
+            padded_list.append(padded)
+        return torch.stack(padded_list)
+
+    unproc_stfts_padded = pad_complex(unproc_stfts)
+    
+    # Pad Mags (Transpose -> Pad -> Transpose back if needed, but we keep [Batch, Time, Freq])
+    mags_transposed = [x.transpose(0, 1) for x in clean_mags]
+    clean_mags_padded = nn.utils.rnn.pad_sequence(mags_transposed, batch_first=True, padding_value=0.0)
+    
+    # Returns:
+    # Inputs: [Batch, Time, Freq]
+    # STFTs: [Batch, Time, Freq] (Complex)
+    # CleanMags: [Batch, Time, Freq]
+    return inputs_padded, unproc_stfts_padded, clean_mags_padded
 
 # ==============================================================================
-# PART 6: MAIN TRAINING (Standard, with Updated Config references)
+# PART 4: MODEL
 # ==============================================================================
-# [Paste main train() loop here - logic is same as previous, just update params]
+
+class DoubleConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.double_conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.GroupNorm(8, out_channels), 
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.GroupNorm(8, out_channels),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+    def forward(self, x): return self.double_conv(x)
+
+class ConvMaskingUNet(nn.Module):
+    def __init__(self, n_freq_bins=1025):
+        super().__init__()
+        self.n_freq_bins = n_freq_bins
+        
+        # Learnable Input Normalization
+        self.input_norm = nn.InstanceNorm2d(1, affine=True)
+        
+        self.inc = DoubleConv(1, 32)
+        self.down1 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(32, 64))
+        self.down2 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(64, 128))
+        self.down3 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(128, 256))
+        self.bot = DoubleConv(256, 512)
+        self.up1 = nn.ConvTranspose2d(512, 256, kernel_size=2, stride=2)
+        self.conv1 = DoubleConv(512, 256)
+        self.up2 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
+        self.conv2 = DoubleConv(256, 128)
+        self.up3 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
+        self.conv3 = DoubleConv(96, 64)
+        self.outc = nn.Conv2d(64, 1, kernel_size=1)
+
+    def forward(self, x):
+        x = x.unsqueeze(1) # [Batch, 1, Time, Freq]
+        x = self.input_norm(x)
+        
+        pad_t = (8 - x.shape[2] % 8) % 8
+        pad_f = (8 - x.shape[3] % 8) % 8
+        x_padded = F.pad(x, (0, pad_f, 0, pad_t))
+        
+        x1 = self.inc(x_padded)
+        x2 = self.down1(x1)
+        x3 = self.down2(x2)
+        x4 = self.down3(x3)
+        x5 = self.bot(x4)
+        
+        x = self.up1(x5)
+        x = self._cat(x, x4)
+        x = self.conv1(x)
+        x = self.up2(x)
+        x = self._cat(x, x3)
+        x = self.conv2(x)
+        x = self.up3(x)
+        x = self._cat(x, x1)
+        x = self.conv3(x)
+        
+        logits = self.outc(x)
+        mask = F.relu(logits) 
+        
+        if pad_t > 0: mask = mask[:, :, :-pad_t, :]
+        mask = mask[:, :, :, :self.n_freq_bins]
+        return mask.squeeze(1)
+    
+    def _cat(self, x, skip):
+        diffY = skip.size(2) - x.size(2)
+        diffX = skip.size(3) - x.size(3)
+        x = F.pad(x, [diffX//2, diffX-diffX//2, diffY//2, diffY-diffY//2])
+        return torch.cat([skip, x], dim=1)
+
+# ==============================================================================
+# PART 5: TRAINING LOOP
+# ==============================================================================
 
 def train():
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    SAMPLE_DIR.mkdir(exist_ok=True)
+    os.makedirs(SAMPLE_DIR, exist_ok=True)
     
-    # SETUP ENCODEC
-    print("\n--- Initializing EnCodec Model ---")
-    encodec_model = EncodecModel.encodec_model_24khz()
-    encodec_model.set_target_bandwidth(TARGET_BANDWIDTH)
-    encodec_model.to(device)
-    encodec_model.eval()
+    print("--- Loading Dataset ---")
+    dataset = MaskingDataset(METADATA_DIR / "train_metadata.json", DRIVE_BASE / "train/unprocessed", DRIVE_BASE / "train/signals", N_FFT, HOP_LENGTH, device)
+    print(f"Dataset size: {len(dataset)}")
     
-    ACTUAL_NUM_TOKENS = 1024 
-    ACTUAL_NUM_CODEBOOKS = 32
-
+    loader = torch.utils.data.DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=pad_collate, num_workers=0)
     
-    mel_transform = T.MelSpectrogram(sample_rate=24000, n_fft=N_FFT, hop_length=HOP_LENGTH, n_mels=N_MELS).to(device)
+    model = ConvMaskingUNet(n_freq_bins=1025).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-2)
+    loss_fn = AudioLoss(n_freqs=1025, sample_rate=SAMPLE_RATE)
     
-    train_dataset = EncodecAudioDataset(METADATA_DIR / "train_metadata.json", DRIVE_BASE / "train/unprocessed", DRIVE_BASE / "train/signals", mel_transform, encodec_model, ACTUAL_NUM_CODEBOOKS, device)
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=pad_collate, drop_last=True)
+    # Warmup + Cosine Scheduler
+    from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
+    warmup = LinearLR(optimizer, start_factor=0.1, total_iters=WARMUP_EPOCHS)
+    cosine = CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS - WARMUP_EPOCHS, eta_min=1e-6)
+    scheduler = SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[WARMUP_EPOCHS])
     
-    model = SpeechEnhancementConformer(N_MELS, ACTUAL_NUM_TOKENS, ACTUAL_NUM_CODEBOOKS, D_MODEL, N_HEAD, NUM_LAYERS).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
-    
-    criterion_signal = nn.L1Loss()
-    criterion_perceptual = MultiResolutionSTFTLoss().to(device)
-    criterion_mel = MelSpectrogramLoss(sample_rate=24000, hop_length=HOP_LENGTH).to(device)
-    
-    print("\nStarting Training...")
+    print(f"\n--- Starting Training ---")
     best_loss = float('inf')
     
     for epoch in range(NUM_EPOCHS):
         model.train()
-        total_loss_avg = 0
+        epoch_loss = 0
+        batch_count = 0
+        last_valid_batch = None
+        optimizer.zero_grad()
         
-        # --- THE WARM-UP LOGIC ---
-        if epoch < WARMUP_EPOCHS:
-            if epoch == 0: print(f"--> STARTING WARM-UP: Identity Training (Input -> Input)")
-            training_target = "identity"
-        else:
-            if epoch == WARMUP_EPOCHS: print(f"--> SWITCHING PHASE: Enhancement Training (Target -> Clean)")
-            training_target = "clean"
-        
-        for batch_idx, (specs, tokens, clean_wavs, unproc_wavs) in enumerate(train_loader):
-            if specs is None: continue
+        for batch_idx, batch_data in enumerate(loader):
+            if batch_data is None: continue
             
-            specs = specs.to(device)
-            tokens = tokens.to(device)
-            clean_wavs = clean_wavs.to(device)
-            unproc_wavs = unproc_wavs.to(device)
+            inputs, unproc_stft, clean_mags = batch_data
+            inputs, clean_mags = inputs.to(device), clean_mags.to(device)
+            unproc_stft = unproc_stft.to(device)
             
-            if training_target == "identity":
-                target_wavs = unproc_wavs
-            else:
-                target_wavs = clean_wavs
+            # Forward
+            predicted_mask = model(inputs)
             
-            optimizer.zero_grad()
-            logits, pred_wavs = model(specs)
+            # Apply Mask to Magnitude
+            # unproc_stft is [Batch, Time, Freq] due to collate
+            unproc_mag = torch.abs(unproc_stft)
+            est_mag = unproc_mag * predicted_mask
             
-            min_len = min(pred_wavs.shape[-1], target_wavs.shape[-1])
-            pred_wavs = pred_wavs[..., :min_len]
-            target_wavs = target_wavs[..., :min_len]
-            
-            # Monitoring Loss (Decoder Head)
-            loss_perc = criterion_perceptual(pred_wavs.squeeze(1), target_wavs.squeeze(1))
-            loss_mel = criterion_mel(pred_wavs.squeeze(1), target_wavs.squeeze(1))
-            
-            # Primary Loss (Token Head)
-            loss_sem = 0
-            if training_target == "clean":
-                for k in range(ACTUAL_NUM_CODEBOOKS):
-                    loss_sem += F.cross_entropy(logits[:, :, k, :].reshape(-1, ACTUAL_NUM_TOKENS), tokens[:, k, :].reshape(-1))
-                loss_sem /= ACTUAL_NUM_CODEBOOKS
-            
-            # Total Loss
-            # During Identity phase: Focus purely on decoder physics
-            if training_target == "identity":
-                loss = (1.0 * loss_perc) + (10.0 * loss_mel)
-            else:
-                # During Clean phase: Focus on Tokens!
-                loss = (LAMBDA_PERCEPTUAL * loss_perc) + (LAMBDA_MEL * loss_mel) + (LAMBDA_SEMANTIC * loss_sem)
-            
+            # Loss
+            loss, metrics = loss_fn(est_mag, clean_mags)
+            loss = loss / ACCUM_STEPS
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
-            optimizer.step()
             
-            total_loss_avg += loss.item()
+            # Step
+            if (batch_idx + 1) % ACCUM_STEPS == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                optimizer.zero_grad()
             
-            if batch_idx % 10 == 0:
-                print(f"Ep {epoch} [{batch_idx}] | {training_target.upper()} | Loss: {loss.item():.4f}")
+            actual_loss = loss.item() * ACCUM_STEPS
+            epoch_loss += actual_loss
+            batch_count += 1
+            last_valid_batch = (inputs, unproc_stft)
+            
+            if batch_idx % 50 == 0:
+                # FEATURE: Live Gradient Monitoring
+                grad_norm = 0.0
+                for p in model.parameters():
+                    if p.grad is not None: 
+                        grad_norm += p.grad.data.norm(2).item() ** 2
+                grad_norm = grad_norm ** 0.5
+                
+                print(f"Ep {epoch} [{batch_idx}] | Loss: {actual_loss:.4f} | "
+                      f"Mag: {metrics['mag']:.3f} | Grad: {grad_norm:.3f}")
 
-        avg_loss = total_loss_avg / max(len(train_loader), 1)
-        print(f"Epoch {epoch} Done. Avg Loss: {avg_loss:.4f}")
-        
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            model_config = {'input_features': N_MELS, 'num_tokens': ACTUAL_NUM_TOKENS, 'num_codebooks': ACTUAL_NUM_CODEBOOKS, 'd_model': D_MODEL, 'nhead': N_HEAD, 'num_layers': NUM_LAYERS}
-            torch.save({
-                'epoch': epoch, 'config': model_config, 
-                'model_state_dict': model.state_dict(), 
-                'optimizer_state_dict': optimizer.state_dict()
-            }, CHECKPOINT_DIR / "best_model.pt")
-            print("Saved Best Model.")
+        if batch_count > 0:
+            avg = epoch_loss / batch_count
+            current_lr = optimizer.param_groups[0]['lr']
+            print(f"Epoch {epoch} Done. Avg: {avg:.4f} | LR: {current_lr:.2e}")
+            scheduler.step()
             
-        with torch.no_grad():
-            sample = pred_wavs[0].cpu()
-            sample = sample / (sample.abs().max() + 1e-6)
-            torchaudio.save(SAMPLE_DIR / f"ep{epoch}_{training_target}_sample.wav", sample, 24000)
+            if avg < best_loss:
+                best_loss = avg
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'loss': avg,
+                }, CHECKPOINT_DIR / "best_model.pt")
+                print(f"✓ New Best Saved: {avg:.4f}")
+            
+            if last_valid_batch is not None:
+                try:
+                    model.eval()
+                    with torch.no_grad():
+                        inputs, raw_stft = last_valid_batch
+                        inp = inputs[0].unsqueeze(0)
+                        pred_mask = model(inp)
+                        
+                        raw_sample = raw_stft[0].unsqueeze(0)
+                        mag = torch.abs(raw_sample)
+                        phase = torch.angle(raw_sample)
+                        
+                        min_t = min(pred_mask.shape[1], mag.shape[1])
+                        # Apply Mask
+                        clean_mag = mag[:, :min_t] * pred_mask[:, :min_t]
+                        
+                        # ISTFT (Reusing Noisy Phase)
+                        # Need [Batch, Freq, Time] for ISTFT
+                        complex_stft = torch.polar(clean_mag, phase[:, :min_t]).transpose(1, 2)
+                        
+                        clean_wav = torch.istft(
+                            complex_stft, 
+                            n_fft=N_FFT, hop_length=HOP_LENGTH, window=torch.hann_window(N_FFT).to(device)
+                        )
+                        torchaudio.save(SAMPLE_DIR / f"ep{epoch}_final_test.wav", clean_wav.cpu(), SAMPLE_RATE)
+                    model.train()
+                except Exception as e: print(f"Val Error: {e}")
 
-if __name__ == '__main__':
+            if (epoch + 1) % 5 == 0:
+                torch.save(model.state_dict(), CHECKPOINT_DIR / f"mask_model_ep{epoch}.pt")
+
+if __name__ == "__main__":
     train()

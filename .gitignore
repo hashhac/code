@@ -1,2 +1,9 @@
 Candanza Data
 .venv/
+Enhanced_Output
+Mask_Checkpoints
+Mask_Samples
+clarity
+Shadow_Dataset
+.hydra
+exp

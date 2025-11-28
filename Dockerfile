@@ -17,7 +17,8 @@ RUN apt-get update && apt-get install -y \
 # 3. encodec (main.py requires it)
 # 4. Upgrade pip and install requirements.txt if present
 RUN pip install --upgrade pip \
-    && pip install torchcodec==0.8 torchaudio==2.4.0 soundfile librosa encodec
+    && pip install torchcodec==0.8 torchaudio==2.4.0 soundfile librosa encodec hydra-core omegaconf openai-whisper pystoi jiwer inflect scipy pandas
+
 
 # If requirements.txt exists, install from it (optional, for user extensibility)
 COPY requiremets.txt ./
