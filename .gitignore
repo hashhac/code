@@ -7,3 +7,6 @@ clarity
 Shadow_Dataset
 .hydra
 exp
+compute_whisper.log
+temp.flac
+predict.log
