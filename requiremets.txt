@@ -1,0 +1,5 @@
+encodec
+torch==2.9.0
+torchaudio==2.9.0
+pathlib
+torchcodec
