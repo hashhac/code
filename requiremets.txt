@@ -11,3 +11,6 @@ jiwer
 inflect 
 scipy 
 pandas
+matplotlib 
+seaborn 
+tqdm
